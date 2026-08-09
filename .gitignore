@@ -17,6 +17,10 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
+# Keep S&P 500 universe metadata
+!data/raw/universe/
+!data/raw/universe/sp500.csv
+
 # OS
 .DS_Store
 
