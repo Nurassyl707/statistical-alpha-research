@@ -6,11 +6,40 @@ import pandas as pd
 from src.data.prices import download_price_data
 
 
-def is_valid_price_file(file_path: Path) -> bool:
+# ============================================================
+# Configuration
+# ============================================================
+
+DEFAULT_UNIVERSE_PATH = "data/raw/universe/sp500.csv"
+DEFAULT_OUTPUT_DIR = "data/raw/prices"
+
+
+# ============================================================
+# Price-file validation
+# ============================================================
+
+def is_valid_price_file(
+    file_path: Path,
+    min_rows: int = 500,
+) -> bool:
     """
-    Check whether an existing price CSV has the expected structure
-    and contains usable market data.
+    Check whether a downloaded price CSV is usable.
+
+    A valid price file must:
+    - exist
+    - contain all required columns
+    - contain at least `min_rows` observations
+    - contain valid dates
+    - contain valid price data
     """
+
+    if not file_path.exists():
+        return False
+
+    try:
+        data = pd.read_csv(file_path)
+    except Exception:
+        return False
 
     required_columns = [
         "Date",
@@ -22,81 +51,121 @@ def is_valid_price_file(file_path: Path) -> bool:
         "Volume",
     ]
 
+    # Check required columns
+    if not all(column in data.columns for column in required_columns):
+        return False
+
+    # Check minimum number of observations
+    if len(data) < min_rows:
+        return False
+
+    # Check dates
     try:
-        df = pd.read_csv(file_path)
-
-        # Check that all expected columns exist
-        if df.columns.tolist() != required_columns:
-            return False
-
-        # File must contain data
-        if df.empty:
-            return False
-
-        # Dates must be valid
-        dates = pd.to_datetime(
-            df["Date"],
-            errors="coerce",
-        )
-
-        if dates.isna().any():
-            return False
-
-        # Required market columns must contain numeric values
-        numeric_columns = [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Adj Close",
-            "Volume",
-        ]
-
-        for column in numeric_columns:
-            values = pd.to_numeric(
-                df[column],
-                errors="coerce",
-            )
-
-            if values.isna().any():
-                return False
-
-        # Dates should not be duplicated
-        if dates.duplicated().any():
-            return False
-
-        return True
-
+        dates = pd.to_datetime(data["Date"])
     except Exception:
         return False
 
+    if dates.isna().any():
+        return False
 
-def download_universe_prices(
-    universe_path: str = "data/raw/universe/sp500.csv",
-    start: str = "2020-01-01",
-    end: str = "2026-08-08",
-    output_dir: str = "data/raw/prices",
-    delay: float = 1.0,
+    # Check price columns
+    price_columns = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj Close",
+    ]
+
+    # Reject rows where all price values are missing
+    if data[price_columns].isna().all(axis=1).any():
+        return False
+
+    return True
+
+
+# ============================================================
+# Universe loading
+# ============================================================
+
+def load_universe(
+    universe_path: str = DEFAULT_UNIVERSE_PATH,
 ) -> pd.DataFrame:
     """
-    Download historical price data for every ticker in a stock universe.
+    Load the stock universe from CSV.
+
+    Expected columns:
+        ticker
+        company
+        sector
+        sub_industry
+    """
+
+    file_path = Path(universe_path)
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Universe file not found: {file_path}"
+        )
+
+    data = pd.read_csv(file_path)
+
+    if "ticker" not in data.columns:
+        raise ValueError(
+            "Universe file must contain a 'ticker' column."
+        )
+
+    # Clean ticker symbols
+    data["ticker"] = (
+        data["ticker"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # Remove empty tickers
+    data = data[data["ticker"] != ""]
+
+    # Remove duplicate tickers
+    data = data.drop_duplicates(
+        subset="ticker"
+    ).reset_index(drop=True)
+
+    return data
+
+
+# ============================================================
+# Download the entire universe
+# ============================================================
+
+def download_universe_prices(
+    universe_path: str = DEFAULT_UNIVERSE_PATH,
+    start: str = "2020-01-01",
+    end: str = "2026-08-08",
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    delay: float = 2.0,
+) -> pd.DataFrame:
+    """
+    Download historical price data for every ticker
+    in the universe.
 
     Existing valid files are skipped.
-    Existing invalid files are downloaded again.
+
+    Invalid or incomplete files are downloaded again.
 
     Parameters
     ----------
     universe_path : str
-        Path to CSV containing a 'ticker' column.
+        Path to the universe CSV.
 
     start : str
-        Start date in YYYY-MM-DD format.
+        Historical start date.
 
     end : str
-        End date in YYYY-MM-DD format.
+        Historical end date.
 
     output_dir : str
-        Directory where price CSV files are stored.
+        Directory where price CSVs are stored.
 
     delay : float
         Number of seconds to wait between downloads.
@@ -104,89 +173,89 @@ def download_universe_prices(
     Returns
     -------
     pandas.DataFrame
-        Download summary.
+        Download summary containing:
+
+        ticker
+        status
+        error
     """
 
+    # --------------------------------------------------------
     # Load universe
-    universe = pd.read_csv(universe_path)
+    # --------------------------------------------------------
 
-    # Validate universe structure
-    if "ticker" not in universe.columns:
-        raise ValueError(
-            "Universe file must contain a 'ticker' column. "
-            f"Found columns: {universe.columns.tolist()}"
-        )
+    universe = load_universe(universe_path)
 
-    # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    # Clean ticker list
-    tickers = (
-        universe["ticker"]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .drop_duplicates()
-        .tolist()
-    )
-
-    total = len(tickers)
+    total = len(universe)
 
     results = []
 
-    # Process each ticker
-    for i, ticker in enumerate(tickers, start=1):
+    # --------------------------------------------------------
+    # Download each ticker
+    # --------------------------------------------------------
 
-        print(f"[{i}/{total}] {ticker}")
+    for position, row in universe.iterrows():
+
+        ticker = row["ticker"]
 
         file_path = output_path / f"{ticker}.csv"
 
-        # ---------------------------------------------------------
-        # Check whether an existing file is valid
-        # ---------------------------------------------------------
-        if file_path.exists():
+        print(
+            f"[{position + 1}/{total}] {ticker}"
+        )
 
-            if is_valid_price_file(file_path):
+        # ----------------------------------------------------
+        # Check whether a usable file already exists
+        # ----------------------------------------------------
 
-                print(
-                    f"  Skipping — valid file already exists: "
-                    f"{file_path}"
-                )
-
-                results.append(
-                    {
-                        "ticker": ticker,
-                        "status": "skipped",
-                        "error": None,
-                    }
-                )
-
-                continue
+        if is_valid_price_file(file_path):
 
             print(
-                "  Existing file is invalid — "
-                "redownloading."
+                f"  Skipping — valid file already exists: "
+                f"{file_path}"
             )
 
-        # ---------------------------------------------------------
-        # Download price data
-        # ---------------------------------------------------------
+            results.append(
+                {
+                    "ticker": ticker,
+                    "status": "skipped",
+                    "error": None,
+                }
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Download data
+        # ----------------------------------------------------
+
         try:
 
-            df = download_price_data(
+            data = download_price_data(
                 ticker=ticker,
                 start=start,
                 end=end,
                 output_dir=output_dir,
             )
 
+            # ------------------------------------------------
+            # Verify downloaded file
+            # ------------------------------------------------
+
+            if not is_valid_price_file(file_path):
+
+                raise ValueError(
+                    "Downloaded file failed validation."
+                )
+
             print(
-                f"  Downloaded {len(df)} rows"
+                f"  Downloaded {len(data)} rows"
             )
 
             results.append(
@@ -200,25 +269,27 @@ def download_universe_prices(
         except Exception as exc:
 
             print(
-                f"  FAILED: {exc}"
+                f"  ERROR: {exc}"
             )
 
             results.append(
                 {
                     "ticker": ticker,
-                    "status": "failed",
+                    "status": "error",
                     "error": str(exc),
                 }
             )
 
-        # ---------------------------------------------------------
+        # ----------------------------------------------------
         # Delay between requests
-        # ---------------------------------------------------------
-        time.sleep(delay)
+        # ----------------------------------------------------
 
-    # -------------------------------------------------------------
-    # Create download summary
-    # -------------------------------------------------------------
+        if position < total - 1:
+            time.sleep(delay)
+
+    # --------------------------------------------------------
+    # Create summary
+    # --------------------------------------------------------
 
     summary = pd.DataFrame(results)
 
@@ -231,15 +302,30 @@ def download_universe_prices(
         index=False,
     )
 
-    print("\nDownload complete.")
+    print()
+    print("Download complete.")
 
     if not summary.empty:
         print(
-            summary["status"].value_counts()
+            summary["status"]
+            .value_counts()
         )
 
+    print()
     print(
-        f"\nSummary saved to: {summary_path}"
+        f"Summary saved to: {summary_path}"
     )
 
     return summary
+
+
+# ============================================================
+# Command-line execution
+# ============================================================
+
+if __name__ == "__main__":
+
+    summary = download_universe_prices()
+
+    print()
+    print(summary.to_string(index=False))
