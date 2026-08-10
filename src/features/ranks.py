@@ -3,9 +3,6 @@ from pathlib import Path
 import pandas as pd
 
 
-# Factors that we want to rank cross-sectionally.
-# Higher return = better.
-# Lower volatility = better.
 RETURN_FACTORS = [
     "return_21d",
     "return_63d",
@@ -27,16 +24,8 @@ def add_cross_sectional_ranks(
     """
     Add cross-sectional percentile ranks for each factor.
 
-    For every trading date, stocks are ranked relative to all other
-    stocks available on that same date.
-
-    Return factors:
-        Higher return -> higher rank.
-
-    Volatility factors:
-        Lower volatility -> higher rank.
-
-    Missing factor values remain NaN.
+    Higher return = higher rank.
+    Lower volatility = higher rank.
     """
 
     input_path = Path(input_file)
@@ -70,53 +59,43 @@ def add_cross_sectional_ranks(
     data["Date"] = pd.to_datetime(data["Date"])
 
     # ---------------------------------------------------------
-    # Cross-sectional percentile ranks
-    # ---------------------------------------------------------
-    #
-    # pct=True converts ranks into values between 0 and 1.
-    #
-    # Example:
-    #
-    # 1.00 -> among the strongest stocks
-    # 0.50 -> around the middle
-    # 0.01 -> among the weakest stocks
-    #
-    # Ranking is performed independently for every date.
+    # Return factors
+    # Higher return = higher rank
     # ---------------------------------------------------------
 
     for column in RETURN_FACTORS:
+
         rank_column = f"{column}_rank"
 
         data[rank_column] = (
             data.groupby("Date")[column]
-            .rank(method="average", pct=True)
+            .rank(
+                method="average",
+                pct=True,
+                ascending=True,
+            )
         )
 
     # ---------------------------------------------------------
-    # Volatility ranking
-    # ---------------------------------------------------------
-    #
-    # For volatility, LOWER volatility is considered better.
-    #
-    # Therefore:
-    #
-    # low volatility -> high rank
-    # high volatility -> low rank
-    #
-    # We calculate the normal percentile rank and then invert it.
+    # Volatility factors
+    # Lower volatility = higher rank
     # ---------------------------------------------------------
 
     for column in VOLATILITY_FACTORS:
+
         rank_column = f"{column}_rank"
 
+        normal_rank = (
+            data.groupby("Date")[column]
+            .rank(
+                method="average",
+                pct=True,
+                ascending=True,
+            )
+        )
+
         data[rank_column] = (
-            1
-            - data.groupby("Date")[column]
-            .rank(method="average", pct=True)
-            + (
-                data.groupby("Date")[column]
-                .transform("count") > 0
-            ) * 0
+            1.0 - normal_rank
         )
 
     # ---------------------------------------------------------
@@ -128,27 +107,38 @@ def add_cross_sectional_ranks(
         exist_ok=True,
     )
 
-    data.to_csv(output_path, index=False)
+    data.to_csv(
+        output_path,
+        index=False,
+    )
 
     print()
     print("Cross-sectional ranking complete.")
+    print("===============================")
+
     print(f"Rows: {len(data):,}")
     print(f"Stocks: {data['ticker'].nunique():,}")
+
     print(
         f"Dates: "
         f"{data['Date'].min().date()} "
         f"to "
         f"{data['Date'].max().date()}"
     )
+
     print()
     print("Rank columns:")
 
     rank_columns = [
         f"{column}_rank"
-        for column in RETURN_FACTORS + VOLATILITY_FACTORS
+        for column in (
+            RETURN_FACTORS
+            + VOLATILITY_FACTORS
+        )
     ]
 
-    print(rank_columns)
+    for column in rank_columns:
+        print(f"  {column}")
 
     print()
     print(f"Saved to: {output_path}")
@@ -160,42 +150,83 @@ def validate_ranks(
     input_file: str = "data/processed/cross_sectional_ranked.csv",
 ) -> None:
     """
-    Validate the generated cross-sectional ranks.
+    Validate generated cross-sectional ranks.
     """
 
-    data = pd.read_csv(input_file)
+    input_path = Path(input_file)
+
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Ranked dataset not found: {input_path}"
+        )
+
+    data = pd.read_csv(input_path)
 
     rank_columns = [
         f"{column}_rank"
-        for column in RETURN_FACTORS + VOLATILITY_FACTORS
+        for column in (
+            RETURN_FACTORS
+            + VOLATILITY_FACTORS
+        )
     ]
 
     print()
     print("Rank validation")
     print("================")
 
+    validation_failed = False
+
     for column in rank_columns:
+
         if column not in data.columns:
             print(f"{column}: MISSING")
+            validation_failed = True
             continue
 
         series = data[column]
-
         non_null = series.dropna()
 
         if non_null.empty:
             print(f"{column}: NO VALID VALUES")
+            validation_failed = True
             continue
+
+        minimum = non_null.min()
+        maximum = non_null.max()
+        mean = non_null.mean()
+        missing = series.isna().sum()
+
+        valid_range = (
+            minimum >= 0.0
+            and maximum <= 1.0
+        )
+
+        if not valid_range:
+            validation_failed = True
+
+        status = "OK" if valid_range else "INVALID"
 
         print(
             f"{column}: "
-            f"min={non_null.min():.4f}, "
-            f"max={non_null.max():.4f}, "
-            f"mean={non_null.mean():.4f}, "
-            f"missing={series.isna().sum():,}"
+            f"min={minimum:.4f}, "
+            f"max={maximum:.4f}, "
+            f"mean={mean:.4f}, "
+            f"missing={missing:,} "
+            f"[{status}]"
         )
+
+    print()
+
+    if validation_failed:
+        raise ValueError(
+            "Rank validation failed."
+        )
+
+    print("All rank columns passed validation.")
 
 
 if __name__ == "__main__":
+
     add_cross_sectional_ranks()
+
     validate_ranks()
