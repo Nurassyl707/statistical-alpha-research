@@ -4,6 +4,10 @@ import numpy as np
 import pandas as pd
 
 
+# ============================================================
+# Paths
+# ============================================================
+
 SIGNALS_PATH = Path(
     "data/processed/cross_sectional_ranked.csv"
 )
@@ -17,8 +21,22 @@ OUTPUT_PATH = Path(
 )
 
 
+# ============================================================
+# Configuration
+# ============================================================
+
+TOP_QUANTILE = 0.10
+
+
+# ============================================================
+# Metrics
+# ============================================================
+
 def calculate_metrics(returns):
-    returns = pd.Series(returns).dropna()
+    returns = (
+        pd.Series(returns)
+        .dropna()
+    )
 
     if returns.empty:
         return {
@@ -40,11 +58,14 @@ def calculate_metrics(returns):
     )
 
     cagr = (
-        equity.iloc[-1] ** (1 / years) - 1
+        equity.iloc[-1]
+        ** (1 / years)
+        - 1
     )
 
     volatility = (
-        returns.std() * np.sqrt(252)
+        returns.std()
+        * np.sqrt(252)
     )
 
     sharpe = (
@@ -56,7 +77,8 @@ def calculate_metrics(returns):
     )
 
     drawdown = (
-        equity / equity.cummax()
+        equity
+        / equity.cummax()
         - 1
     )
 
@@ -69,7 +91,12 @@ def calculate_metrics(returns):
     }
 
 
+# ============================================================
+# Load signals
+# ============================================================
+
 def load_signals():
+
     print("Loading signals...")
 
     df = pd.read_csv(
@@ -83,10 +110,12 @@ def load_signals():
     required = [
         "Date",
         "ticker",
+
         "return_21d_rank",
         "return_63d_rank",
         "return_126d_rank",
         "return_252d_rank",
+
         "volatility_21d_rank",
         "volatility_63d_rank",
         "volatility_252d_rank",
@@ -106,7 +135,12 @@ def load_signals():
     return df
 
 
+# ============================================================
+# Load prices
+# ============================================================
+
 def load_prices():
+
     print("Loading prices...")
 
     frames = []
@@ -149,6 +183,8 @@ def load_prices():
             "Date"
         )
 
+        # Return from today's close
+        # to next trading day's close.
         data["next_return"] = (
             data["Adj Close"].shift(-1)
             / data["Adj Close"]
@@ -167,22 +203,68 @@ def load_prices():
         ignore_index=True,
     )
 
+    prices = prices.sort_values(
+        ["Date", "ticker"]
+    )
+
+    prices = prices.drop_duplicates(
+        subset=[
+            "Date",
+            "ticker",
+        ]
+    )
+
+    print(
+        f"Loaded {prices['ticker'].nunique()} stocks."
+    )
+
+    print(
+        f"Price observations: "
+        f"{len(prices):,}"
+    )
+
+    print(
+        f"Price date range: "
+        f"{prices['Date'].min().date()} "
+        f"to "
+        f"{prices['Date'].max().date()}"
+    )
+
     return prices
 
+
+# ============================================================
+# Construct monthly portfolios
+# ============================================================
 
 def construct_portfolio(
     signals,
     signal_column,
-    top_quantile=0.10,
+    ascending=False,
 ):
+    """
+    Construct equal-weight monthly portfolio.
+
+    ascending=False:
+        highest factor ranks selected.
+
+    ascending=True:
+        lowest factor ranks selected.
+
+    Portfolio is formed using information
+    available at the month-end date.
+    """
+
     data = signals.copy()
 
     data = data.dropna(
         subset=[signal_column]
     )
 
-    # Last available trading day
-    # of each calendar month.
+    # --------------------------------------------------------
+    # Identify month-end signal date.
+    # --------------------------------------------------------
+
     data["month"] = (
         data["Date"]
         .dt.to_period("M")
@@ -199,12 +281,15 @@ def construct_portfolio(
         )
     ].copy()
 
+    # --------------------------------------------------------
     # Cross-sectional ranking.
+    # --------------------------------------------------------
+
     data["rank"] = (
         data.groupby("Date")[signal_column]
         .rank(
             method="first",
-            ascending=False,
+            ascending=ascending,
         )
     )
 
@@ -215,15 +300,26 @@ def construct_portfolio(
 
     data["n_holdings"] = (
         data["n_stocks"]
-        * top_quantile
-    ).apply(
-        lambda x: max(1, int(x))
+        * TOP_QUANTILE
+    ).astype(int)
+
+    data["n_holdings"] = (
+        data["n_holdings"]
+        .clip(lower=1)
     )
+
+    # --------------------------------------------------------
+    # Select portfolio.
+    # --------------------------------------------------------
 
     selected = data[
         data["rank"]
         <= data["n_holdings"]
     ].copy()
+
+    # --------------------------------------------------------
+    # Equal weights.
+    # --------------------------------------------------------
 
     selected["weight"] = (
         1.0
@@ -241,49 +337,164 @@ def construct_portfolio(
     ]
 
 
+# ============================================================
+# Convert monthly portfolio into daily returns
+# ============================================================
+
 def calculate_portfolio_returns(
     portfolio,
     prices,
+    start_date,
+    end_date,
 ):
-    data = portfolio.merge(
-        prices[
+    """
+    Portfolio formed at month-end t.
+
+    Returns begin on the NEXT available
+    trading day after t.
+
+    Positions remain unchanged until
+    the next rebalance.
+    """
+
+    portfolio = portfolio.copy()
+
+    portfolio_dates = sorted(
+        portfolio["Date"].unique()
+    )
+
+    all_daily_returns = []
+
+    for i, rebalance_date in enumerate(
+        portfolio_dates
+    ):
+
+        rebalance_date = pd.Timestamp(
+            rebalance_date
+        )
+
+        # ----------------------------------------------------
+        # Determine next rebalance.
+        # ----------------------------------------------------
+
+        if i + 1 < len(
+            portfolio_dates
+        ):
+
+            next_rebalance = pd.Timestamp(
+                portfolio_dates[i + 1]
+            )
+
+        else:
+
+            next_rebalance = (
+                pd.Timestamp(end_date)
+            )
+
+        # ----------------------------------------------------
+        # Portfolio holdings.
+        # ----------------------------------------------------
+
+        weights = portfolio[
+            portfolio["Date"]
+            == rebalance_date
+        ][
             [
-                "Date",
                 "ticker",
-                "next_return",
+                "weight",
             ]
-        ],
-        on=[
-            "Date",
-            "ticker",
-        ],
-        how="left",
+        ].copy()
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Start STRICTLY AFTER rebalance date.
+        # ----------------------------------------------------
+
+        period_prices = prices[
+            (prices["Date"] > rebalance_date)
+            & (
+                prices["Date"]
+                <= next_rebalance
+            )
+            & (
+                prices["Date"]
+                >= start_date
+            )
+            & (
+                prices["Date"]
+                <= end_date
+            )
+        ].copy()
+
+        if period_prices.empty:
+            continue
+
+        # ----------------------------------------------------
+        # Merge weights with daily returns.
+        # ----------------------------------------------------
+
+        period = period_prices.merge(
+            weights,
+            on="ticker",
+            how="inner",
+        )
+
+        # ----------------------------------------------------
+        # Weighted returns.
+        # ----------------------------------------------------
+
+        period["weighted_return"] = (
+            period["next_return"]
+            * period["weight"]
+        )
+
+        daily = (
+            period.groupby("Date")
+            ["weighted_return"]
+            .sum(
+                min_count=1
+            )
+            .reset_index()
+        )
+
+        daily = daily.rename(
+            columns={
+                "weighted_return":
+                    "portfolio_return"
+            }
+        )
+
+        all_daily_returns.append(
+            daily
+        )
+
+    if not all_daily_returns:
+        return pd.Series(
+            dtype=float
+        )
+
+    result = pd.concat(
+        all_daily_returns,
+        ignore_index=True,
     )
 
-    data["contribution"] = (
-        data["weight"]
-        * data["next_return"]
+    result = (
+        result
+        .drop_duplicates(
+            subset=["Date"]
+        )
+        .sort_values("Date")
     )
 
-    # IMPORTANT:
-    #
-    # The return associated with a
-    # rebalance date is the NEXT
-    # trading day's return.
-    #
-    # Therefore the portfolio is
-    # formed using information available
-    # at the rebalance date and does
-    # not use future returns.
+    return result.set_index(
+        "Date"
+    )["portfolio_return"]
 
-    returns = (
-        data.groupby("Date")
-        ["contribution"]
-        .sum(min_count=1)
-    )
 
-    return returns
-
+# ============================================================
+# Main
+# ============================================================
 
 def main():
 
@@ -291,27 +502,19 @@ def main():
 
     prices = load_prices()
 
-    strategies = {
-        "21D Momentum": "return_21d_rank",
-
-        "63D Momentum": "return_63d_rank",
-
-        "126D Momentum": "return_126d_rank",
-
-        "252D Momentum": "return_252d_rank",
-
-        "Momentum Composite": None,
-
-        "Low Volatility": None,
-    }
-
-    # Composite signals are constructed
-    # entirely from ranks available on
-    # the rebalance date.
+    # ========================================================
+    # Create factor signals
+    # ========================================================
 
     signals = signals.copy()
 
-    signals["momentum_composite"] = (
+    # --------------------------------------------------------
+    # Momentum composite
+    # --------------------------------------------------------
+
+    signals[
+        "momentum_composite"
+    ] = (
         0.10
         * signals["return_21d_rank"]
         + 0.20
@@ -322,33 +525,124 @@ def main():
         * signals["return_252d_rank"]
     )
 
-    signals["low_volatility_composite"] = (
-        (
-            signals[
-                "volatility_21d_rank"
+    # --------------------------------------------------------
+    # Low-volatility composite
+    #
+    # LOWER volatility is better.
+    # --------------------------------------------------------
+
+    signals[
+        "low_volatility_composite"
+    ] = (
+        signals[
+            [
+                "volatility_21d_rank",
+                "volatility_63d_rank",
+                "volatility_252d_rank",
             ]
-            + signals[
-                "volatility_63d_rank"
-            ]
-            + signals[
-                "volatility_252d_rank"
-            ]
-        )
-        / 3
+        ]
+        .mean(axis=1)
     )
 
-    strategies[
-        "Momentum Composite"
-    ] = "momentum_composite"
+    # ========================================================
+    # Strategy definitions
+    # ========================================================
 
-    strategies[
-        "Low Volatility"
-    ] = "low_volatility_composite"
+    strategies = {
+
+        "21D Momentum": (
+            "return_21d_rank",
+            False,
+        ),
+
+        "63D Momentum": (
+            "return_63d_rank",
+            False,
+        ),
+
+        "126D Momentum": (
+            "return_126d_rank",
+            False,
+        ),
+
+        "252D Momentum": (
+            "return_252d_rank",
+            False,
+        ),
+
+        "Momentum Composite": (
+            "momentum_composite",
+            False,
+        ),
+
+        "Low Volatility": (
+            "low_volatility_composite",
+            True,
+        ),
+    }
+
+    # ========================================================
+    # Determine common evaluation period
+    # ========================================================
+
+    # The 252-day factor is the slowest factor.
+    # Start only once its signal exists.
+
+    valid_252 = signals.dropna(
+        subset=[
+            "return_252d_rank"
+        ]
+    )
+
+    valid_dates = sorted(
+        valid_252["Date"].unique()
+    )
+
+    if not valid_dates:
+        raise ValueError(
+            "No valid 252D factor dates."
+        )
+
+    first_signal_date = pd.Timestamp(
+        valid_dates[0]
+    )
+
+    last_price_date = pd.Timestamp(
+        prices["Date"].max()
+    )
+
+    print()
+    print(
+        "Common Evaluation Period"
+    )
+    print(
+        "========================="
+    )
+
+    print(
+        f"Start: "
+        f"{first_signal_date.date()}"
+    )
+
+    print(
+        f"End:   "
+        f"{last_price_date.date()}"
+    )
+
+    # ========================================================
+    # Run strategies
+    # ========================================================
 
     results = []
 
-    for name, signal_column in strategies.items():
+    return_series = {}
 
+    for name, (
+        signal_column,
+        ascending,
+    ) in strategies.items():
+
+        print()
         print(
             f"Running: {name}"
         )
@@ -356,12 +650,75 @@ def main():
         portfolio = construct_portfolio(
             signals,
             signal_column,
+            ascending=ascending,
         )
 
         returns = calculate_portfolio_returns(
-            portfolio,
-            prices,
+            portfolio=portfolio,
+            prices=prices,
+            start_date=first_signal_date,
+            end_date=last_price_date,
         )
+
+        # ----------------------------------------------------
+        # Ensure common period.
+        # ----------------------------------------------------
+
+        returns = returns[
+            (
+                returns.index
+                >= first_signal_date
+            )
+            & (
+                returns.index
+                <= last_price_date
+            )
+        ]
+
+        return_series[name] = returns
+
+    # ========================================================
+    # Force identical dates
+    # ========================================================
+
+    combined = pd.concat(
+        return_series,
+        axis=1,
+        join="inner",
+    )
+
+    combined = combined.dropna()
+
+    print()
+    print(
+        "Common Daily Return Matrix"
+    )
+    print(
+        "=========================="
+    )
+
+    print(
+        f"Trading days: "
+        f"{len(combined):,}"
+    )
+
+    print(
+        f"Start: "
+        f"{combined.index.min().date()}"
+    )
+
+    print(
+        f"End: "
+        f"{combined.index.max().date()}"
+    )
+
+    # ========================================================
+    # Calculate metrics
+    # ========================================================
+
+    for name in strategies:
+
+        returns = combined[name]
 
         metrics = calculate_metrics(
             returns
@@ -371,10 +728,6 @@ def main():
 
         metrics["Trading Days"] = (
             len(returns)
-        )
-
-        metrics["Rebalance Dates"] = (
-            portfolio["Date"].nunique()
         )
 
         results.append(
@@ -394,13 +747,16 @@ def main():
             "Max Drawdown",
             "Total Return",
             "Trading Days",
-            "Rebalance Dates",
         ]
     ]
 
+    # ========================================================
+    # Display
+    # ========================================================
+
     print()
     print(
-        "Clean Factor Backtest"
+        "Final Factor Backtest"
     )
     print(
         "====================="
@@ -414,21 +770,23 @@ def main():
         )
     )
 
-    output = OUTPUT_PATH
+    # ========================================================
+    # Save
+    # ========================================================
 
-    output.parent.mkdir(
+    OUTPUT_PATH.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     results_df.to_csv(
-        output,
+        OUTPUT_PATH,
         index=False,
     )
 
     print()
     print(
-        f"Saved to: {output}"
+        f"Saved to: {OUTPUT_PATH}"
     )
 
 

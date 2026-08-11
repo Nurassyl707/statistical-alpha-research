@@ -12,65 +12,19 @@ PRICES_DIR = Path(
     "data/raw/prices"
 )
 
+OUTPUT_PATH = Path(
+    "data/processed/factor_attribution.csv"
+)
 
-def calculate_metrics(returns):
-    returns = pd.Series(returns).dropna()
-
-    if len(returns) == 0:
-        return {
-            "CAGR": np.nan,
-            "Volatility": np.nan,
-            "Sharpe": np.nan,
-            "Max Drawdown": np.nan,
-            "Total Return": np.nan,
-        }
-
-    equity = (1 + returns).cumprod()
-
-    years = len(returns) / 252
-
-    total_return = equity.iloc[-1] - 1
-
-    cagr = (
-        equity.iloc[-1] ** (1 / years) - 1
-        if years > 0
-        else np.nan
-    )
-
-    volatility = (
-        returns.std() * np.sqrt(252)
-    )
-
-    sharpe = (
-        returns.mean()
-        / returns.std()
-        * np.sqrt(252)
-        if returns.std() > 0
-        else np.nan
-    )
-
-    drawdown = (
-        equity / equity.cummax()
-        - 1
-    )
-
-    return {
-        "CAGR": cagr,
-        "Volatility": volatility,
-        "Sharpe": sharpe,
-        "Max Drawdown": drawdown.min(),
-        "Total Return": total_return,
-    }
+QUINTILES = 5
 
 
-def load_data():
+def load_signals():
     print("Loading signal data...")
 
     df = pd.read_csv(SIGNALS_PATH)
 
-    df["Date"] = pd.to_datetime(
-        df["Date"]
-    )
+    df["Date"] = pd.to_datetime(df["Date"])
 
     required = [
         "Date",
@@ -98,125 +52,140 @@ def load_data():
     return df
 
 
-def build_signal(
-    df,
-    factors,
-):
-    data = df.copy()
+def load_prices():
+    print("Loading prices...")
 
-    data["signal"] = (
-        data[factors]
-        .mean(axis=1)
-    )
-
-    return data
-
-
-def run_portfolio(
-    df,
-    signal_column="signal",
-    top_quantile=0.10,
-):
-    data = df.dropna(
-        subset=[signal_column]
-    ).copy()
-
-    data["month"] = (
-        data["Date"]
-        .dt.to_period("M")
-    )
-
-    rebalance_dates = (
-        data.groupby("month")["Date"]
-        .max()
-    )
-
-    data = data[
-        data["Date"].isin(
-            rebalance_dates.values
-        )
-    ].copy()
-
-    data["rank"] = (
-        data.groupby("Date")[signal_column]
-        .rank(
-            method="first",
-            ascending=False,
-        )
-    )
-
-    data["n_stocks"] = (
-        data.groupby("Date")["ticker"]
-        .transform("count")
-    )
-
-    data["n_holdings"] = (
-        data["n_stocks"]
-        * top_quantile
-    ).apply(
-        lambda x: max(1, int(x))
-    )
-
-    selected = data[
-        data["rank"]
-        <= data["n_holdings"]
-    ].copy()
-
-    selected["weight"] = (
-        1
-        / selected.groupby("Date")
-        ["ticker"]
-        .transform("count")
-    )
-
-    # Load prices needed to calculate
-    # next-day returns.
     frames = []
 
-    for ticker in selected["ticker"].unique():
+    files = sorted(
+        PRICES_DIR.glob("*.csv")
+    )
 
-        path = (
-            PRICES_DIR
-            / f"{ticker}.csv"
-        )
+    for file_path in files:
 
-        if not path.exists():
+        if file_path.name == "download_summary.csv":
             continue
 
-        price = pd.read_csv(path)
+        ticker = file_path.stem
+
+        data = pd.read_csv(file_path)
 
         if (
-            "Date" not in price.columns
-            or "Adj Close" not in price.columns
+            "Date" not in data.columns
+            or "Adj Close" not in data.columns
         ):
             continue
 
-        price = price[
-            ["Date", "Adj Close"]
+        data = data[
+            [
+                "Date",
+                "Adj Close",
+            ]
         ].copy()
 
-        price["Date"] = pd.to_datetime(
-            price["Date"]
+        data["Date"] = pd.to_datetime(
+            data["Date"]
         )
 
-        price["ticker"] = ticker
+        data["ticker"] = ticker
 
-        price["next_return"] = (
-            price.groupby("ticker")
-            ["Adj Close"]
-            .shift(-1)
-            / price["Adj Close"]
+        data = data.sort_values(
+            "Date"
+        )
+
+        data["next_return"] = (
+            data["Adj Close"].shift(-1)
+            / data["Adj Close"]
             - 1
         )
 
-        frames.append(price)
+        frames.append(data)
+
+    if not frames:
+        raise ValueError(
+            "No valid price files found."
+        )
 
     prices = pd.concat(
         frames,
         ignore_index=True,
     )
 
-    selected = selected.merge(
+    print(
+        f"Loaded {prices['ticker'].nunique()} stocks."
+    )
+
+    print(
+        f"Price observations: {len(prices):,}"
+    )
+
+    print(
+        "Price date range: "
+        f"{prices['Date'].min().date()} to "
+        f"{prices['Date'].max().date()}"
+    )
+
+    return prices
+
+
+def construct_factor_signals(df):
+    data = df.copy()
+
+    # Same composite definitions as the
+    # final factor_backtest.py.
+    data["momentum_composite"] = (
+        0.10 * data["return_21d_rank"]
+        + 0.20 * data["return_63d_rank"]
+        + 0.30 * data["return_126d_rank"]
+        + 0.40 * data["return_252d_rank"]
+    )
+
+    data["low_volatility_composite"] = (
+        data[
+            [
+                "volatility_21d_rank",
+                "volatility_63d_rank",
+                "volatility_252d_rank",
+            ]
+        ].mean(axis=1)
+    )
+
+    return data
+
+
+def get_month_end_dates(data):
+    monthly = (
+        data.assign(
+            month=data["Date"].dt.to_period("M")
+        )
+        .groupby("month")["Date"]
+        .max()
+    )
+
+    return pd.DatetimeIndex(
+        monthly.values
+    )
+
+
+def prepare_evaluation_data(
+    signals,
+    prices,
+):
+    data = signals.copy()
+
+    # Use only monthly rebalance dates.
+    rebalance_dates = get_month_end_dates(
+        data
+    )
+
+    data = data[
+        data["Date"].isin(
+            rebalance_dates
+        )
+    ].copy()
+
+    # Merge next trading-day returns.
+    data = data.merge(
         prices[
             [
                 "Date",
@@ -224,97 +193,396 @@ def run_portfolio(
                 "next_return",
             ]
         ],
-        on=["Date", "ticker"],
+        on=[
+            "Date",
+            "ticker",
+        ],
         how="left",
     )
 
-    selected["contribution"] = (
-        selected["weight"]
-        * selected["next_return"]
+    data = data.dropna(
+        subset=["next_return"]
+    ).copy()
+
+    return data
+
+
+def calculate_quintile_returns(
+    data,
+    signal_column,
+    low_is_good=False,
+):
+    working = data[
+        [
+            "Date",
+            "ticker",
+            signal_column,
+            "next_return",
+        ]
+    ].dropna().copy()
+
+    # Cross-sectional quintiles are calculated
+    # independently on every rebalance date.
+    #
+    # For momentum:
+    #   Q1 = lowest momentum
+    #   Q5 = highest momentum
+    #
+    # For low volatility:
+    #   Q1 = lowest volatility
+    #   Q5 = highest volatility
+
+    working["quintile"] = (
+        working.groupby("Date")[signal_column]
+        .rank(
+            method="first",
+            pct=True,
+        )
+        .mul(QUINTILES)
+        .apply(np.ceil)
+        .clip(
+            lower=1,
+            upper=QUINTILES,
+        )
+        .astype(int)
     )
 
-    portfolio = (
-        selected.groupby("Date")
-        ["contribution"]
-        .sum()
+    quintile_returns = (
+        working.groupby(
+            [
+                "Date",
+                "quintile",
+            ]
+        )["next_return"]
+        .mean()
+        .unstack("quintile")
+        .sort_index()
     )
 
-    return portfolio
+    quintile_returns.columns = [
+        f"Q{int(column)}"
+        for column in quintile_returns.columns
+    ]
+
+    # Ensure all quintile columns exist.
+    for i in range(1, QUINTILES + 1):
+
+        column = f"Q{i}"
+
+        if column not in quintile_returns.columns:
+            quintile_returns[column] = np.nan
+
+    quintile_returns = quintile_returns[
+        [
+            f"Q{i}"
+            for i in range(1, QUINTILES + 1)
+        ]
+    ]
+
+    # Factor spread.
+    #
+    # Momentum:
+    #   highest minus lowest = Q5 - Q1
+    #
+    # Low volatility:
+    #   lowest volatility minus highest =
+    #   Q1 - Q5
+    if low_is_good:
+
+        quintile_returns["Spread"] = (
+            quintile_returns["Q1"]
+            - quintile_returns["Q5"]
+        )
+
+    else:
+
+        quintile_returns["Spread"] = (
+            quintile_returns["Q5"]
+            - quintile_returns["Q1"]
+        )
+
+    return working, quintile_returns
+
+
+def calculate_ic(
+    data,
+    signal_column,
+):
+    working = data[
+        [
+            "Date",
+            signal_column,
+            "next_return",
+        ]
+    ].dropna().copy()
+
+    ic = (
+        working.groupby("Date")
+        .apply(
+            lambda group:
+            group[signal_column].corr(
+                group["next_return"],
+                method="spearman",
+            ),
+            include_groups=False,
+        )
+        .dropna()
+    )
+
+    return ic
+
+
+def annualized_return(
+    daily_or_period_returns
+):
+    returns = pd.Series(
+        daily_or_period_returns
+    ).dropna()
+
+    if len(returns) == 0:
+        return np.nan
+
+    cumulative = (
+        1 + returns
+    ).prod()
+
+    years = len(returns) / 12
+
+    if years <= 0:
+        return np.nan
+
+    return (
+        cumulative ** (1 / years)
+        - 1
+    )
+
+
+def summarize_factor(
+    strategy,
+    data,
+    signal_column,
+    low_is_good=False,
+):
+    _, quintile_returns = (
+        calculate_quintile_returns(
+            data,
+            signal_column,
+            low_is_good=low_is_good,
+        )
+    )
+
+    ic = calculate_ic(
+        data,
+        signal_column,
+    )
+
+    result = {
+        "Strategy": strategy,
+    }
+
+    # Quintile statistics.
+    for i in range(1, QUINTILES + 1):
+
+        column = f"Q{i}"
+
+        series = (
+            quintile_returns[column]
+            .dropna()
+        )
+
+        result[
+            f"{column} Mean Return"
+        ] = series.mean()
+
+        result[
+            f"{column} Annualized Return"
+        ] = annualized_return(series)
+
+    spread = (
+        quintile_returns["Spread"]
+        .dropna()
+    )
+
+    result["Spread Mean Return"] = (
+        spread.mean()
+    )
+
+    result["Spread Annualized Return"] = (
+        annualized_return(spread)
+    )
+
+    # Information coefficient.
+    result["Mean IC"] = ic.mean()
+
+    result["IC Std"] = ic.std()
+
+    result["IC IR"] = (
+        ic.mean() / ic.std()
+        if ic.std() > 0
+        else np.nan
+    )
+
+    result["Positive IC %"] = (
+        (ic > 0).mean()
+    )
+
+    result["IC Observations"] = (
+        len(ic)
+    )
+
+    result["Rebalance Dates"] = (
+        quintile_returns.index.nunique()
+    )
+
+    return result, quintile_returns, ic
 
 
 def main():
 
-    df = load_data()
+    signals = load_signals()
+
+    prices = load_prices()
+
+    signals = construct_factor_signals(
+        signals
+    )
+
+    data = prepare_evaluation_data(
+        signals,
+        prices,
+    )
+
+    if data.empty:
+        raise ValueError(
+            "No observations available "
+            "after evaluation-period filtering."
+        )
+
+    print()
+    print(
+        "Factor Attribution Evaluation"
+    )
+    print(
+        "============================="
+    )
+
+    print(
+        "Start:",
+        data["Date"].min().date()
+    )
+
+    print(
+        "End:  ",
+        data["Date"].max().date()
+    )
+
+    print(
+        "Rebalance dates:",
+        data["Date"].nunique()
+    )
 
     strategies = {
-        "21D Momentum": [
+        "21D Momentum": (
             "return_21d_rank",
-        ],
+            False,
+        ),
 
-        "63D Momentum": [
+        "63D Momentum": (
             "return_63d_rank",
-        ],
+            False,
+        ),
 
-        "126D Momentum": [
+        "126D Momentum": (
             "return_126d_rank",
-        ],
+            False,
+        ),
 
-        "252D Momentum": [
+        "252D Momentum": (
             "return_252d_rank",
-        ],
+            False,
+        ),
 
-        "Momentum Composite": [
-            "return_21d_rank",
-            "return_63d_rank",
-            "return_126d_rank",
-            "return_252d_rank",
-        ],
+        "Momentum Composite": (
+            "momentum_composite",
+            False,
+        ),
 
-        "Low Volatility": [
-            "volatility_21d_rank",
-            "volatility_63d_rank",
-            "volatility_252d_rank",
-        ],
+        "Low Volatility": (
+            "low_volatility_composite",
+            True,
+        ),
     }
 
     results = []
 
-    for name, factors in strategies.items():
+    quintile_outputs = {}
 
+    ic_outputs = {}
+
+    for name, (
+        signal_column,
+        low_is_good,
+    ) in strategies.items():
+
+        print()
         print(
             f"Running: {name}"
         )
 
-        data = build_signal(
-            df,
-            factors,
-        )
-
-        returns = run_portfolio(
-            data
-        )
-
-        metrics = calculate_metrics(
-            returns
-        )
-
-        metrics["Strategy"] = name
-
-        results.append(metrics)
-
-    results_df = (
-        pd.DataFrame(results)
-        [
-            [
-                "Strategy",
-                "CAGR",
-                "Volatility",
-                "Sharpe",
-                "Max Drawdown",
-                "Total Return",
+        required_data = data.dropna(
+            subset=[
+                signal_column,
+                "next_return",
             ]
-        ]
+        ).copy()
+
+        result, quintiles, ic = (
+            summarize_factor(
+                name,
+                required_data,
+                signal_column,
+                low_is_good=low_is_good,
+            )
+        )
+
+        results.append(result)
+
+        quintile_outputs[name] = quintiles
+
+        ic_outputs[name] = ic
+
+    results_df = pd.DataFrame(
+        results
     )
+
+    results_df = results_df[
+        [
+            "Strategy",
+
+            "Q1 Mean Return",
+            "Q2 Mean Return",
+            "Q3 Mean Return",
+            "Q4 Mean Return",
+            "Q5 Mean Return",
+
+            "Q1 Annualized Return",
+            "Q2 Annualized Return",
+            "Q3 Annualized Return",
+            "Q4 Annualized Return",
+            "Q5 Annualized Return",
+
+            "Spread Mean Return",
+            "Spread Annualized Return",
+
+            "Mean IC",
+            "IC Std",
+            "IC IR",
+            "Positive IC %",
+            "IC Observations",
+
+            "Rebalance Dates",
+        ]
+    ]
 
     print()
     print(
@@ -328,28 +596,97 @@ def main():
         results_df.to_string(
             index=False,
             float_format=lambda x:
-                f"{x:.4f}"
+            f"{x:.4f}"
         )
     )
 
-    output = Path(
-        "data/processed/"
-        "factor_attribution.csv"
-    )
-
-    output.parent.mkdir(
+    OUTPUT_PATH.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     results_df.to_csv(
-        output,
+        OUTPUT_PATH,
+        index=False,
+    )
+
+    # Save detailed quintile returns.
+    quintile_output = Path(
+        "data/processed/"
+        "factor_quintile_returns.csv"
+    )
+
+    quintile_frames = []
+
+    for strategy, frame in (
+        quintile_outputs.items()
+    ):
+
+        temp = frame.copy()
+
+        temp["Strategy"] = strategy
+
+        temp = temp.reset_index()
+
+        quintile_frames.append(
+            temp
+        )
+
+    quintile_df = pd.concat(
+        quintile_frames,
+        ignore_index=True,
+    )
+
+    quintile_df.to_csv(
+        quintile_output,
+        index=False,
+    )
+
+    # Save daily/monthly IC observations.
+    ic_output = Path(
+        "data/processed/"
+        "factor_ic.csv"
+    )
+
+    ic_frames = []
+
+    for strategy, series in (
+        ic_outputs.items()
+    ):
+
+        temp = series.rename(
+            "IC"
+        ).reset_index()
+
+        temp["Strategy"] = strategy
+
+        ic_frames.append(
+            temp
+        )
+
+    ic_df = pd.concat(
+        ic_frames,
+        ignore_index=True,
+    )
+
+    ic_df.to_csv(
+        ic_output,
         index=False,
     )
 
     print()
     print(
-        f"Saved to: {output}"
+        f"Saved summary to: {OUTPUT_PATH}"
+    )
+
+    print(
+        f"Saved quintile returns to: "
+        f"{quintile_output}"
+    )
+
+    print(
+        f"Saved IC data to: "
+        f"{ic_output}"
     )
 
 

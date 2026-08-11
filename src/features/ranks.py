@@ -229,4 +229,4 @@ if __name__ == "__main__":
 
     add_cross_sectional_ranks()
 
-    validate_ranks()
+    validate_ranks
